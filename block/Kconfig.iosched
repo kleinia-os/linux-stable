@@ -43,5 +43,23 @@ config BFQ_CGROUP_DEBUG
 	help
 	Enable some debugging help. Currently it exports additional stat
 	files in a cgroup which can be useful for debugging.
+	
+config IOSCHED_EXT
+	bool "eBPF I/O Scheduler Extension"
+	default y
+	depends on BLK_DEV_IO_TRACE || BLOCK  # 确保依赖关系正确
+	select BLK_ICQ
+	help
+	  Enable the eBPF-based extensible I/O scheduler framework.
+
+config IOSCHED_EXT_DEBUG
+	bool "iosched_ext verbose debug logging"
+	depends on IOSCHED_EXT
+	default n
+	help
+	  Enables IOEXT_DEBUG: extra counters and high-volume pr_info traces
+	  (insert/dispatch/prepare/finish/complete/requeue, validate failures,
+	  teardown, has-work anomalies). For development; keep disabled for
+	  production.
 
 endmenu

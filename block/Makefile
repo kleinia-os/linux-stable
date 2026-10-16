@@ -40,4 +40,9 @@ obj-$(CONFIG_BLK_INLINE_ENCRYPTION)	+= blk-crypto.o blk-crypto-profile.o \
 obj-$(CONFIG_BLK_INLINE_ENCRYPTION_FALLBACK)	+= blk-crypto-fallback.o
 obj-$(CONFIG_BLOCK_HOLDER_DEPRECATED)	+= holder.o
 
+obj-$(CONFIG_IOSCHED_EXT) += iosched_ext.o
+ifdef CONFIG_IOSCHED_EXT_DEBUG
+CFLAGS_iosched_ext.o += -DIOEXT_DEBUG=1
+endif
+
 obj-$(CONFIG_BLK_MERGE_KUNIT_TEST) += blk-merge-test.o
