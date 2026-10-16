@@ -13,6 +13,7 @@
 #include <linux/btf_ids.h>
 #include <linux/rcupdate_wait.h>
 #include <linux/poll.h>
+#include <linux/cgroup.h>
 
 struct bpf_struct_ops_value {
 	struct bpf_struct_ops_common_value common;
@@ -59,6 +60,8 @@ struct bpf_struct_ops_link {
 	struct bpf_link link;
 	struct bpf_map __rcu *map;
 	wait_queue_head_t wait_hup;
+
+	struct cgroup *cgroup_ctx;
 };
 
 static DEFINE_MUTEX(update_mutex);
@@ -1272,9 +1275,17 @@ static void bpf_struct_ops_map_link_dealloc(struct bpf_link *link)
 	st_map = (struct bpf_struct_ops_map *)
 		rcu_dereference_protected(st_link->map, true);
 	if (st_map) {
-		st_map->st_ops_desc->st_ops->unreg(&st_map->kvalue.data, link);
+		if (st_map->st_ops_desc->st_ops->unreg_ctx && st_link->cgroup_ctx)
+			st_map->st_ops_desc->st_ops->unreg_ctx(st_map->kvalue.data,
+									link,
+									st_link->cgroup_ctx);
+		else
+			st_map->st_ops_desc->st_ops->unreg(&st_map->kvalue.data,
+								link);
 		bpf_map_put(&st_map->map);
 	}
+	if (st_link->cgroup_ctx)
+		cgroup_put(st_link->cgroup_ctx);
 	kfree(st_link);
 }
 
@@ -1371,14 +1382,21 @@ static int bpf_struct_ops_map_link_detach(struct bpf_link *link)
 		return 0;
 	}
 	st_map = container_of(map, struct bpf_struct_ops_map, map);
-
-	st_map->st_ops_desc->st_ops->unreg(&st_map->kvalue.data, link);
+	if (st_map->st_ops_desc->st_ops->unreg_ctx && st_link->cgroup_ctx)
+		st_map->st_ops_desc->st_ops->unreg_ctx(st_map->kvalue.data, link,
+						      st_link->cgroup_ctx);
+	else
+		st_map->st_ops_desc->st_ops->unreg(&st_map->kvalue.data, link);
 
 	RCU_INIT_POINTER(st_link->map, NULL);
 	/* Pair with bpf_map_get() in bpf_struct_ops_link_create() or
 	 * bpf_map_inc() in bpf_struct_ops_map_link_update().
 	 */
 	bpf_map_put(&st_map->map);
+	if (st_link->cgroup_ctx) {
+		cgroup_put(st_link->cgroup_ctx);
+		st_link->cgroup_ctx = NULL;
+	}
 
 	mutex_unlock(&update_mutex);
 
@@ -1413,6 +1431,7 @@ int bpf_struct_ops_link_create(union bpf_attr *attr)
 	struct bpf_struct_ops_map *st_map;
 	struct bpf_map *map;
 	int err;
+	struct cgroup *cgrp = NULL;
 
 	map = bpf_map_get(attr->link_create.map_fd);
 	if (IS_ERR(map))
@@ -1424,7 +1443,19 @@ int bpf_struct_ops_link_create(union bpf_attr *attr)
 		err = -EINVAL;
 		goto err_out;
 	}
+	if (attr->link_create.target_fd) {
+		if (!st_map->st_ops_desc->st_ops->reg_ctx) {
+			err = -EOPNOTSUPP;
+			goto err_out;
+		}
 
+		cgrp = cgroup_get_from_fd(attr->link_create.target_fd);
+		if (IS_ERR(cgrp)) {
+			err = PTR_ERR(cgrp);
+			cgrp = NULL;
+			goto err_out;
+		}
+	}
 	link = kzalloc_obj(*link, GFP_USER);
 	if (!link) {
 		err = -ENOMEM;
@@ -1432,7 +1463,8 @@ int bpf_struct_ops_link_create(union bpf_attr *attr)
 	}
 	bpf_link_init(&link->link, BPF_LINK_TYPE_STRUCT_OPS, &bpf_struct_ops_map_lops, NULL,
 		      attr->link_create.attach_type);
-
+	link->cgroup_ctx = cgrp;
+	cgrp = NULL;
 	err = bpf_link_prime(&link->link, &link_primer);
 	if (err)
 		goto err_out;
@@ -1443,7 +1475,13 @@ int bpf_struct_ops_link_create(union bpf_attr *attr)
 	 * do link->ops->detach() before the link is fully initialized.
 	 */
 	mutex_lock(&update_mutex);
-	err = st_map->st_ops_desc->st_ops->reg(st_map->kvalue.data, &link->link);
+	if (st_map->st_ops_desc->st_ops->reg_ctx && link->cgroup_ctx)
+		err = st_map->st_ops_desc->st_ops->reg_ctx(st_map->kvalue.data,
+							  &link->link,
+							  link->cgroup_ctx);
+	else
+		err = st_map->st_ops_desc->st_ops->reg(st_map->kvalue.data,
+						      &link->link);
 	if (err) {
 		mutex_unlock(&update_mutex);
 		bpf_link_cleanup(&link_primer);
@@ -1457,6 +1495,10 @@ int bpf_struct_ops_link_create(union bpf_attr *attr)
 
 err_out:
 	bpf_map_put(map);
+	if (link && link->cgroup_ctx)
+		cgroup_put(link->cgroup_ctx);
+	if (cgrp)
+		cgroup_put(cgrp);
 	kfree(link);
 	return err;
 }

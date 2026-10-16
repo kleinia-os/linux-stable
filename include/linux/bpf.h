@@ -2143,6 +2143,8 @@ struct bpf_struct_ops {
 	struct module *owner;
 	const char *name;
 	struct btf_func_model func_models[BPF_STRUCT_OPS_MAX_NR_MEMBERS];
+	int (*reg_ctx)(void *kdata, struct bpf_link *link, void *ctx);
+	void (*unreg_ctx)(void *kdata, struct bpf_link *link, void *ctx);
 };
 
 /* Every member of a struct_ops type has an instance even a member is not
