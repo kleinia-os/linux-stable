@@ -229,6 +229,13 @@ config BLK_ERROR_INJECTION
 
 	  See Documentation/block/error-injection.rst for details.
 
+config BLK_MERGE_KUNIT_TEST
+	bool "Block merge KUnit tests" if !KUNIT_ALL_TESTS
+	depends on KUNIT=y
+	default KUNIT_ALL_TESTS
+	help
+	  Build KUnit tests for block merge helpers.
+
 source "block/Kconfig.iosched"
 
 endif # BLOCK

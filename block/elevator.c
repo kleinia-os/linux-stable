@@ -647,6 +647,19 @@ static int elevator_change_done(struct request_queue *q,
 	return ret;
 }
 
+static void elevator_prepare_switch(struct request_queue *q,
+		struct elv_change_ctx *ctx)
+{
+	struct elevator_queue *e;
+
+	mutex_lock(&q->elevator_lock);
+	e = q->elevator;
+	if (e && !elevator_match(e->type, ctx->name) &&
+	    e->type->ops.prepare_switch)
+		e->type->ops.prepare_switch(q);
+	mutex_unlock(&q->elevator_lock);
+}
+
 /*
  * Switch this queue to the given IO scheduler.
  */
@@ -659,12 +672,15 @@ static int elevator_change(struct request_queue *q, struct elv_change_ctx *ctx)
 	lockdep_assert_held(&set->update_nr_hwq_lock);
 
 	if (strncmp(ctx->name, "none", 4)) {
+		if (!ctx->type)
+			return -EINVAL;
 		ret = blk_mq_alloc_sched_res(q, ctx->type, &ctx->res,
 				set->nr_hw_queues);
 		if (ret)
 			return ret;
 	}
 
+	elevator_prepare_switch(q, ctx);
 	memflags = blk_mq_freeze_queue(q);
 	/*
 	 * May be called before adding disk, when there isn't any FS I/O,

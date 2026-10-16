@@ -341,9 +341,14 @@ enum bio_merge_status {
 enum bio_merge_status bio_attempt_back_merge(struct request *req,
 		struct bio *bio, unsigned int nr_segs);
 bool blk_attempt_plug_merge(struct request_queue *q, struct bio *bio,
-		unsigned int nr_segs);
+		unsigned int nr_segs, bool bypass);
 bool blk_bio_list_merge(struct request_queue *q, struct list_head *list,
 			struct bio *bio, unsigned int nr_segs);
+
+static inline bool blk_mq_bypass_rq(struct request *rq)
+{
+	return rq->q->elevator && !(rq->rq_flags & RQF_USE_SCHED);
+}
 
 /*
  * Plug flush limits

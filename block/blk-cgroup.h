@@ -19,10 +19,13 @@
 #include <linux/kthread.h>
 #include <linux/blk-mq.h>
 #include <linux/llist.h>
+#include <linux/rwsem.h>
 #include "blk.h"
 
 struct blkcg_gq;
 struct blkg_policy_data;
+struct iosched_ext_ops;
+struct scx_io_policy;
 
 
 /* percpu_counter batch for blkg_[rw]stats, per-cpu drift doesn't matter */
@@ -117,6 +120,9 @@ struct blkcg {
 #ifdef CONFIG_CGROUP_WRITEBACK
 	struct list_head		cgwb_list;
 #endif
+
+	struct scx_io_policy __rcu	*iosched_policy;
+	struct rw_semaphore			iosched_sem;
 };
 
 static inline struct blkcg *css_to_blkcg(struct cgroup_subsys_state *css)

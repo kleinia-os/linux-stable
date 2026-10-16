@@ -504,6 +504,11 @@ static void blk_mq_limit_depth(struct blk_mq_alloc_data *data)
 		return;
 	}
 
+	if (data->bypass) {
+		blk_mq_tag_busy(data->hctx);
+		return;
+	}
+
 	/*
 	 * All requests use scheduler tags when an I/O scheduler is
 	 * enabled for the queue.
@@ -2567,6 +2572,11 @@ static void blk_mq_request_bypass_insert(struct request *rq, blk_insert_t flags)
 	spin_unlock(&hctx->lock);
 }
 
+static bool blk_mq_uses_sched_path(struct request *rq)
+{
+	return rq->q->elevator && (rq->rq_flags & RQF_USE_SCHED);
+}
+
 static void blk_mq_insert_requests(struct blk_mq_hw_ctx *hctx,
 		struct blk_mq_ctx *ctx, struct list_head *list,
 		bool run_queue_async)
@@ -2645,13 +2655,15 @@ static void blk_mq_insert_request(struct request *rq, blk_insert_t flags)
 		 * intensive flush workloads can benefit in case of NCQ HW.
 		 */
 		blk_mq_request_bypass_insert(rq, BLK_MQ_INSERT_AT_HEAD);
-	} else if (q->elevator) {
+	} else if (q->elevator && !blk_mq_bypass_rq(rq)) {
 		LIST_HEAD(list);
 
 		WARN_ON_ONCE(rq->tag != BLK_MQ_NO_TAG);
 
 		list_add(&rq->queuelist, &list);
 		q->elevator->type->ops.insert_requests(hctx, &list, flags);
+	} else if (blk_mq_bypass_rq(rq)) {
+		blk_mq_request_bypass_insert(rq, flags);
 	} else {
 		trace_block_rq_insert(rq);
 
@@ -2899,6 +2911,7 @@ static void blk_mq_dispatch_list(struct rq_list *rqs, bool from_sched)
 	struct rq_list requeue_list = {};
 	unsigned int depth = 0;
 	bool is_passthrough = false;
+	bool uses_sched = false;
 	LIST_HEAD(list);
 
 	do {
@@ -2908,8 +2921,10 @@ static void blk_mq_dispatch_list(struct rq_list *rqs, bool from_sched)
 			this_hctx = rq->mq_hctx;
 			this_ctx = rq->mq_ctx;
 			is_passthrough = blk_rq_is_passthrough(rq);
+			uses_sched = blk_mq_uses_sched_path(rq);
 		} else if (this_hctx != rq->mq_hctx || this_ctx != rq->mq_ctx ||
-			   is_passthrough != blk_rq_is_passthrough(rq)) {
+			  is_passthrough != blk_rq_is_passthrough(rq) ||
+			  uses_sched != blk_mq_uses_sched_path(rq)) {
 			rq_list_add_tail(&requeue_list, rq);
 			continue;
 		}
@@ -2927,9 +2942,19 @@ static void blk_mq_dispatch_list(struct rq_list *rqs, bool from_sched)
 		list_splice_tail_init(&list, &this_hctx->dispatch);
 		spin_unlock(&this_hctx->lock);
 		blk_mq_run_hw_queue(this_hctx, from_sched);
-	} else if (this_hctx->queue->elevator) {
+	} else if (this_hctx->queue->elevator && uses_sched) {
 		this_hctx->queue->elevator->type->ops.insert_requests(this_hctx,
 				&list, 0);
+		blk_mq_run_hw_queue(this_hctx, from_sched);
+	} else if (this_hctx->queue->elevator && !uses_sched) {
+		/*
+		 * Bypass requests must not go through ctx->rq_lists, because
+		 * elevator-active dispatch only drains the scheduler and
+		 * hctx->dispatch.
+		 */
+		spin_lock(&this_hctx->lock);
+		list_splice_tail_init(&list, &this_hctx->dispatch);
+		spin_unlock(&this_hctx->lock);
 		blk_mq_run_hw_queue(this_hctx, from_sched);
 	} else {
 		blk_mq_insert_requests(this_hctx, this_ctx, &list, from_sched);
@@ -3015,21 +3040,10 @@ out:
 		blk_mq_commit_rqs(hctx, queued, false);
 }
 
-static bool blk_mq_attempt_bio_merge(struct request_queue *q,
-				     struct bio *bio, unsigned int nr_segs)
-{
-	if (!blk_queue_nomerges(q) && bio_mergeable(bio)) {
-		if (blk_attempt_plug_merge(q, bio, nr_segs))
-			return true;
-		if (blk_mq_sched_bio_merge(q, bio, nr_segs))
-			return true;
-	}
-	return false;
-}
-
 static struct request *blk_mq_get_new_requests(struct request_queue *q,
-					       struct blk_plug *plug,
-					       struct bio *bio)
+							struct blk_plug *plug,
+			      struct bio *bio,
+				      bool bypass)
 {
 	struct blk_mq_alloc_data data = {
 		.q		= q,
@@ -3037,6 +3051,7 @@ static struct request *blk_mq_get_new_requests(struct request_queue *q,
 		.shallow_depth	= 0,
 		.cmd_flags	= bio->bi_opf,
 		.rq_flags	= 0,
+		.bypass		= bypass,
 		.nr_tags	= 1,
 		.cached_rqs	= NULL,
 		.ctx		= NULL,
@@ -3062,7 +3077,7 @@ static struct request *blk_mq_get_new_requests(struct request_queue *q,
  * Check if there is a suitable cached request and return it.
  */
 static struct request *blk_mq_get_cached_request(struct blk_plug *plug,
-		struct request_queue *q, blk_opf_t opf)
+		struct request_queue *q, blk_opf_t opf, bool bypass)
 {
 	enum hctx_type type = blk_mq_get_hctx_type(opf);
 	struct request *rq;
@@ -3076,6 +3091,8 @@ static struct request *blk_mq_get_cached_request(struct blk_plug *plug,
 	    (type != HCTX_TYPE_READ || rq->mq_hctx->type != HCTX_TYPE_DEFAULT))
 		return NULL;
 	if (op_is_flush(rq->cmd_flags) != op_is_flush(opf))
+		return NULL;
+	if (bypass != blk_mq_bypass_rq(rq))
 		return NULL;
 	rq_list_pop(&plug->cached_rqs);
 	return rq;
@@ -3115,11 +3132,10 @@ void blk_mq_submit_bio(struct bio *bio)
 	unsigned int nr_segs;
 	struct request *rq;
 	blk_status_t ret;
+	bool bypass = false;
+	bool entered_queue = false;
 
-	/*
-	 * If the plug has a cached request for this queue, try to use it.
-	 */
-	rq = blk_mq_get_cached_request(plug, q, bio->bi_opf);
+	rq = NULL;
 
 	/*
 	 * A BIO that was released from a zone write plug has already been
@@ -3129,8 +3145,6 @@ void blk_mq_submit_bio(struct bio *bio)
 	 */
 	if (bio_zone_write_plugging(bio)) {
 		nr_segs = bio->__bi_nr_segments;
-		if (rq)
-			blk_queue_exit(q);
 		goto new_request;
 	}
 
@@ -3138,10 +3152,9 @@ void blk_mq_submit_bio(struct bio *bio)
 	 * The cached request already holds a q_usage_counter reference and we
 	 * don't have to acquire a new one if we use it.
 	 */
-	if (!rq) {
 		if (unlikely(bio_queue_enter(bio)))
 			return;
-	}
+	entered_queue = true;
 
 	/*
 	 * Device reconfiguration may change logical block size or reduce the
@@ -3167,8 +3180,23 @@ void blk_mq_submit_bio(struct bio *bio)
 		bio_integrity_prep(bio, integrity_action);
 
 	blk_mq_bio_issue_init(q, bio);
-	if (blk_mq_attempt_bio_merge(q, bio, nr_segs))
-		goto queue_exit;
+	bypass = q->elevator && q->elevator->type->ops.bio_should_bypass &&
+		q->elevator->type->ops.bio_should_bypass(q, bio);
+
+	if (plug)
+		rq = blk_mq_get_cached_request(plug, q, bio->bi_opf, bypass);
+	if (rq) {
+		blk_queue_exit(q);
+		entered_queue = false;
+	}
+
+	if (!blk_queue_nomerges(q) && bio_mergeable(bio)) {
+		if (blk_attempt_plug_merge(q, bio, nr_segs, bypass))
+			goto queue_exit;
+
+		if (!bypass && blk_mq_sched_bio_merge(q, bio, nr_segs))
+			goto queue_exit;
+	}
 
 	if (bio_needs_zone_write_plugging(bio)) {
 		if (blk_zone_plug_bio(bio, nr_segs))
@@ -3182,7 +3210,7 @@ new_request:
 		INIT_LIST_HEAD(&rq->queuelist);
 		blk_mq_rq_late_init(rq, blk_time_get_ns());
 	} else {
-		rq = blk_mq_get_new_requests(q, plug, bio);
+		rq = blk_mq_get_new_requests(q, plug, bio, bypass);
 		if (unlikely(!rq)) {
 			if (bio->bi_opf & REQ_NOWAIT)
 				bio_wouldblock_error(bio);
@@ -3225,7 +3253,7 @@ new_request:
 	return;
 
 queue_exit:
-	if (!rq)
+	if (entered_queue)
 		blk_queue_exit(q);
 	else
 		rq_list_add_head(&plug->cached_rqs, rq);

@@ -1403,6 +1403,8 @@ blkcg_css_alloc(struct cgroup_subsys_state *parent_css)
 	}
 
 	spin_lock_init(&blkcg->lock);
+	init_rwsem(&blkcg->iosched_sem);
+	RCU_INIT_POINTER(blkcg->iosched_policy, NULL);
 	refcount_set(&blkcg->online_pin, 1);
 	INIT_RADIX_TREE(&blkcg->blkg_tree, GFP_NOWAIT);
 	INIT_HLIST_HEAD(&blkcg->blkg_list);

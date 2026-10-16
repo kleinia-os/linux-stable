@@ -164,6 +164,7 @@ struct blk_mq_alloc_data {
 	unsigned int shallow_depth;
 	blk_opf_t cmd_flags;
 	req_flags_t rq_flags;
+	bool bypass;
 
 	/* allocate multiple requests/tags in one go */
 	unsigned int nr_tags;

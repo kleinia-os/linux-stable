@@ -1064,6 +1064,7 @@ static enum bio_merge_status blk_attempt_bio_merge(struct request_queue *q,
  * @q: request_queue new bio is being queued at
  * @bio: new bio being queued
  * @nr_segs: number of segments in @bio
+ * @bypass: merge only with requests matching this scheduler bypass state
  * from the passed in @q already in the plug list
  *
  * Determine whether @bio being queued on @q can be merged with the previous
@@ -1080,7 +1081,7 @@ static enum bio_merge_status blk_attempt_bio_merge(struct request_queue *q,
  * Caller must ensure !blk_queue_nomerges(q) beforehand.
  */
 bool blk_attempt_plug_merge(struct request_queue *q, struct bio *bio,
-		unsigned int nr_segs)
+		unsigned int nr_segs, bool bypass)
 {
 	struct blk_plug *plug = current->plug;
 	struct request *rq;
@@ -1089,14 +1090,18 @@ bool blk_attempt_plug_merge(struct request_queue *q, struct bio *bio,
 		return false;
 
 	rq = plug->mq_list.tail;
-	if (rq->q == q)
+	if (rq->q == q) {
+		if (bypass != blk_mq_bypass_rq(rq))
+			return false;
 		return blk_attempt_bio_merge(q, rq, bio, nr_segs, false) ==
 			BIO_MERGE_OK;
-	else if (!plug->multiple_queues)
+	} else if (!plug->multiple_queues)
 		return false;
 
 	rq_list_for_each(&plug->mq_list, rq) {
 		if (rq->q != q)
+			continue;
+		if (bypass != blk_mq_bypass_rq(rq))
 			continue;
 		if (blk_attempt_bio_merge(q, rq, bio, nr_segs, false) ==
 		    BIO_MERGE_OK)
