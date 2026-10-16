@@ -29,6 +29,7 @@
 #include <linux/cnum.h>
 #include <linux/bpf_mem_alloc.h>
 #include <net/xdp.h>
+#include <linux/cache_ext.h>
 #include <linux/trace_events.h>
 #include <linux/kallsyms.h>
 
@@ -9742,6 +9743,62 @@ static int set_rbtree_add_callback_state(struct bpf_verifier_env *env,
 	return 0;
 }
 
+static int set_cache_ext_list_iterate_callback_state(
+	struct bpf_verifier_env *env,
+	struct bpf_func_state *caller,
+	struct bpf_func_state *callee,
+	int insn_idx)
+{
+	/* int bpf_cache_ext_list_iterate(struct mem_cgroup *memcg,
+	 *       u64 list,
+	 *       int (iter_fn)(int idx, struct cache_ext_list_node *node),
+	 *       struct cache_ext_eviction_ctx *ctx)
+	 */
+	bpf_mark_reg_not_init(env, &callee->regs[BPF_REG_0]);
+
+	__mark_reg_unknown(env, &callee->regs[BPF_REG_1]);
+
+	callee->regs[BPF_REG_2].type = PTR_TO_BTF_ID;
+	__mark_reg_known_zero(&callee->regs[BPF_REG_2]);
+	callee->regs[BPF_REG_2].btf = btf_vmlinux;
+	callee->regs[BPF_REG_2].btf_id = btf_tracing_ids[BTF_TRACING_TYPE_CACHE_EXT_LIST_NODE];
+
+	bpf_mark_reg_not_init(env, &callee->regs[BPF_REG_3]);
+	bpf_mark_reg_not_init(env, &callee->regs[BPF_REG_4]);
+	bpf_mark_reg_not_init(env, &callee->regs[BPF_REG_5]);
+
+	callee->in_callback_fn = true;
+	callee->callback_ret_range = retval_range(0, 2);
+	return 0;
+}
+
+static int set_cache_ext_list_sample_callback_state(
+	struct bpf_verifier_env *env,
+	struct bpf_func_state *caller,
+	struct bpf_func_state *callee,
+	int insn_idx)
+{
+	/* s64 bpf_cache_ext_list_sample(struct mem_cgroup *memcg, u64 list,
+	 *          s64(score_fn)(struct cache_ext_list_node *a),
+	 *          struct sampling_options *opts,
+	 *          struct cache_ext_eviction_ctx *ctx)
+	 */
+	bpf_mark_reg_not_init(env, &callee->regs[BPF_REG_0]);
+
+	callee->regs[BPF_REG_1].type = PTR_TO_BTF_ID;
+	__mark_reg_known_zero(&callee->regs[BPF_REG_1]);
+	callee->regs[BPF_REG_1].btf = btf_vmlinux;
+	callee->regs[BPF_REG_1].btf_id = btf_tracing_ids[BTF_TRACING_TYPE_CACHE_EXT_LIST_NODE];
+
+	bpf_mark_reg_not_init(env, &callee->regs[BPF_REG_3]);
+	bpf_mark_reg_not_init(env, &callee->regs[BPF_REG_4]);
+	bpf_mark_reg_not_init(env, &callee->regs[BPF_REG_5]);
+
+	callee->in_callback_fn = true;
+	callee->callback_ret_range = retval_range(S32_MIN, S32_MAX);
+	return 0;
+}
+
 static int set_task_work_schedule_callback_state(struct bpf_verifier_env *env,
 						 struct bpf_func_state *caller,
 						 struct bpf_func_state *callee,
@@ -11830,7 +11887,9 @@ static bool kfunc_spin_allowed(u32 btf_id)
 
 static bool is_sync_callback_calling_kfunc(u32 btf_id)
 {
-	return is_bpf_rbtree_add_kfunc(btf_id);
+	return btf_id == special_kfunc_list[KF_bpf_rbtree_add_impl] ||
+	       cache_ext_is_callback_calling_kfunc_iterate(btf_id) ||
+	       cache_ext_is_callback_calling_kfunc_sample(btf_id);
 }
 
 static bool is_async_callback_calling_kfunc(u32 btf_id)
@@ -13184,6 +13243,24 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	if (is_bpf_rbtree_add_kfunc(meta.func_id)) {
 		err = push_callback_call(env, insn, insn_idx, meta.subprogno,
 					 set_rbtree_add_callback_state);
+		if (err) {
+			verbose(env, "kfunc %s#%d failed callback verification\n",
+				func_name, meta.func_id);
+			return err;
+		}
+	}
+
+	if (cache_ext_is_callback_calling_kfunc_iterate(meta.func_id)) {
+		err = push_callback_call(env, insn, insn_idx, meta.subprogno,
+					 set_cache_ext_list_iterate_callback_state);
+		if (err) {
+			verbose(env, "kfunc %s#%d failed callback verification\n",
+				func_name, meta.func_id);
+			return err;
+		}
+	} else if (cache_ext_is_callback_calling_kfunc_sample(meta.func_id)) {
+		err = push_callback_call(env, insn, insn_idx, meta.subprogno,
+					 set_cache_ext_list_sample_callback_state);
 		if (err) {
 			verbose(env, "kfunc %s#%d failed callback verification\n",
 				func_name, meta.func_id);

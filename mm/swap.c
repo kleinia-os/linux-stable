@@ -31,6 +31,7 @@
 #include <linux/notifier.h>
 #include <linux/backing-dev.h>
 #include <linux/memcontrol.h>
+#include <linux/cache_ext.h>
 #include <linux/gfp.h>
 #include <linux/uio.h>
 #include <linux/hugetlb.h>
@@ -495,6 +496,16 @@ static bool lru_gen_clear_refs(struct folio *folio)
  */
 void folio_mark_accessed(struct folio *folio)
 {
+	struct mem_cgroup *memcg;
+	struct cache_ext_ops *pcext_ops;
+
+	memcg = folio_memcg(folio);
+	rcu_read_lock();
+	pcext_ops = get_cache_ext_ops(memcg);
+	if (pcext_ops != NULL && pcext_ops->folio_accessed != NULL)
+		pcext_ops->folio_accessed(folio);
+	rcu_read_unlock();
+
 	if (folio_test_dropbehind(folio))
 		return;
 	if (lru_gen_enabled()) {

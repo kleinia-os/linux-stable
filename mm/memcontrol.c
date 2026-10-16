@@ -62,6 +62,10 @@
 #include <linux/seq_buf.h>
 #include <linux/sched/isolation.h>
 #include <linux/kmemleak.h>
+#include <linux/proc_fs.h>
+#include <linux/minmax.h>
+#include <linux/rwsem.h>
+#include <linux/cache_ext.h>
 #include "internal.h"
 #include "swap_table.h"
 #include <net/sock.h>
@@ -122,6 +126,215 @@ struct vmpressure *memcg_to_vmpressure(struct mem_cgroup *memcg)
 struct mem_cgroup *vmpressure_to_memcg(struct vmpressure *vmpr)
 {
 	return container_of(vmpr, struct mem_cgroup, vmpressure);
+}
+
+/*
+ * Page Cache Extension.
+ */
+
+/**
+ * get_cache_ext_ops - fetch the cache_ext ops installed on @memcg's cgroup.
+ *
+ * Callers must hold rcu_read_lock() (or cache_ext_sem for writers); the
+ * returned pointer is only valid until the enclosing read-side critical
+ * section ends.  RCU (not the rwsem) protects the read side because hooks
+ * fire from atomic contexts (pte lock, i_pages xa lock).
+ */
+noinline struct cache_ext_ops *get_cache_ext_ops(struct mem_cgroup *memcg)
+{
+	struct cgroup *cgrp;
+
+	if (!memcg || !memcg->cache_ext_valid)
+		return NULL;
+
+	cgrp = memcg->css.cgroup;
+	if (!cgrp)
+		return NULL;
+
+	return rcu_dereference_check(cgrp->bpf.cache_ext_ops,
+				     lockdep_is_held(&cgrp->bpf.cache_ext_sem));
+}
+
+/*
+ * Valid folios set code.
+ */
+
+static inline uintptr_t folio_ptr_to_key (struct folio *folio) {
+	return (uintptr_t)folio;
+}
+
+inline struct valid_folios_set *folio_to_valid_folios_set(struct folio *folio) {
+	struct mem_cgroup *memcg = folio_memcg(folio);
+	pg_data_t *pgdat = folio_pgdat(folio);
+	struct mem_cgroup_per_node *node_cgroup = memcg->nodeinfo[pgdat->node_id];
+	struct valid_folios_set *valid_folios_set = node_cgroup->valid_folios_set;
+	return valid_folios_set;
+}
+
+inline struct valid_folios_set *memcg_to_valid_folios_set(struct mem_cgroup *memcg) {
+	return memcg->nodeinfo[0]->valid_folios_set;
+}
+
+inline struct valid_folios_set *lruvec_to_valid_folios_set(struct lruvec *lruvec) {
+	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
+	pg_data_t *pgdat = lruvec_pgdat(lruvec);
+	struct mem_cgroup_per_node *node_cgroup = memcg->nodeinfo[pgdat->node_id];
+	struct valid_folios_set *valid_folios_set = node_cgroup->valid_folios_set;
+	return valid_folios_set;
+}
+
+spinlock_t *valid_folios_set_get_bucket_lock(struct valid_folios_set *valid_folios_set, struct folio *folio) {
+	uintptr_t key = folio_ptr_to_key(folio);
+	int bkt = hash_bucket_idx(valid_folios_set->valid_folios, key);
+	if (bkt < 0 || bkt >= VALID_FOLIOS_SET_SIZE) {
+		pr_err("invalid bkt: %d", bkt);
+		BUG();
+	}
+	return &valid_folios_set->bucket_locks[bkt];
+}
+
+struct valid_folios_set* init_valid_folios_set(int node, uint64_t num_buckets) {
+	struct sysinfo sysinfo;
+	si_meminfo(&sysinfo);
+	uint64_t total_memory_in_bytes = sysinfo.totalram * sysinfo.mem_unit;
+	uint64_t total_memory_in_mbytes = total_memory_in_bytes / (1024*1024);
+	pr_info("cache_ext: Cgroup sees available memory: %llu B (%llu MB)\n",
+		total_memory_in_bytes, total_memory_in_mbytes);
+	struct valid_folios_set *valid_folios_set;
+	valid_folios_set = vmalloc_huge(sizeof(struct valid_folios_set), GFP_KERNEL | __GFP_ZERO);
+	if (!valid_folios_set) {
+		pr_err("cache_ext: Failed to allocate valid folios set\n");
+		return NULL;
+	}
+	atomic64_set(&valid_folios_set->nr_entries, 0);
+
+	hash_init(valid_folios_set->valid_folios);
+	for (int i = 0; i < VALID_FOLIOS_SET_SIZE; i++) {
+		spin_lock_init(&valid_folios_set->bucket_locks[i]);
+	}
+	return valid_folios_set;
+}
+
+void free_valid_folios_set(struct valid_folios_set *valid_folios_set) {
+	struct valid_folio *cur;
+	struct hlist_node *tmp;
+	int bkt;
+	pr_info("Freeing valid folios set");
+	hash_for_each_safe(valid_folios_set->valid_folios, bkt, tmp, cur, h_node) {
+		hash_del(&cur->h_node);
+		kfree(cur);
+	}
+	vfree(valid_folios_set);
+}
+
+void valid_folios_add(struct folio *folio) {
+	struct valid_folio *new = kmalloc(sizeof(struct valid_folio), GFP_KERNEL);
+	WARN_ON_ONCE(!new);
+	struct cache_ext_list_node *node = cache_ext_list_node_alloc(folio);
+	new->folio_ptr = folio_ptr_to_key(folio);
+	struct valid_folios_set *valid_folios_set = folio_to_valid_folios_set(folio);
+	spinlock_t *bucket_lock = valid_folios_set_get_bucket_lock(valid_folios_set, folio);
+	spin_lock(bucket_lock);
+	if (valid_folios_exists_unlocked(valid_folios_set, folio)) {
+		spin_unlock(bucket_lock);
+		kfree(new);
+		cache_ext_list_node_free(node);
+		return;
+	}
+	new->cache_ext_node = node;
+	hash_add(valid_folios_set->valid_folios, &new->h_node, new->folio_ptr);
+	spin_unlock(bucket_lock);
+	atomic64_fetch_add(1, &valid_folios_set->nr_entries);
+}
+
+void valid_folios_del(struct folio *folio) {
+	if (in_interrupt()) {
+		pr_err("valid_folios_del called in irq mode!\n");
+	}
+	struct valid_folios_set *valid_folios_set = folio_to_valid_folios_set(folio);
+	struct valid_folio *cur;
+	spinlock_t *bucket_lock = valid_folios_set_get_bucket_lock(valid_folios_set, folio);
+	spin_lock(bucket_lock);
+	uintptr_t key = folio_ptr_to_key(folio);
+	hash_for_each_possible(valid_folios_set->valid_folios, cur, h_node, key) {
+		if (cur->folio_ptr == key) {
+			hash_del(&cur->h_node);
+			cache_ext_ds_registry_write_lock(folio);
+			list_del(&cur->cache_ext_node->node);
+			cache_ext_ds_registry_write_unlock(folio);
+			cache_ext_list_node_free(cur->cache_ext_node);
+			kfree(cur);
+			spin_unlock(bucket_lock);
+			atomic64_fetch_add(-1, &valid_folios_set->nr_entries);
+			return;
+		}
+	}
+	spin_unlock(bucket_lock);
+}
+
+void valid_folios_clear_list(struct valid_folios_set *valid_folios_set) {
+	struct valid_folio *cur;
+	spinlock_t *bucket_lock;
+
+	for (int i = 0; i < VALID_FOLIOS_SET_SIZE; i++) {
+		bucket_lock = &valid_folios_set->bucket_locks[i];
+		spin_lock(bucket_lock);
+		hlist_for_each_entry(cur, &valid_folios_set->valid_folios[i], h_node) {
+			INIT_LIST_HEAD(&cur->cache_ext_node->node);
+		}
+		spin_unlock(bucket_lock);
+	}
+}
+
+bool valid_folios_exists(struct valid_folios_set *valid_folios_set, struct folio *folio) {
+	spinlock_t *bucket_lock = valid_folios_set_get_bucket_lock(valid_folios_set, folio);
+	spin_lock(bucket_lock);
+	bool ret = valid_folios_exists_unlocked(valid_folios_set, folio);
+	spin_unlock(bucket_lock);
+	return ret;
+}
+
+bool valid_folios_exists_unlocked(struct valid_folios_set *valid_folios_set, struct folio *folio) {
+	struct valid_folio *cur;
+	uintptr_t key = folio_ptr_to_key(folio);
+	hash_for_each_possible(valid_folios_set->valid_folios, cur, h_node, key) {
+		if (cur->folio_ptr == key) {
+			return true;
+		}
+	}
+	return false;
+}
+
+u64 valid_folios_get_nr_entries(struct valid_folios_set *valid_folios_set) {
+	return (u64) (atomic64_read(&valid_folios_set->nr_entries));
+}
+
+struct valid_folio *valid_folios_lookup(struct folio *folio) {
+	struct valid_folios_set *valid_folios_set = folio_to_valid_folios_set(folio);
+	struct valid_folio *cur;
+	uintptr_t key = folio_ptr_to_key(folio);
+	hash_for_each_possible(valid_folios_set->valid_folios, cur, h_node, key) {
+		if (cur->folio_ptr == key) {
+			return cur;
+		}
+	}
+	return NULL;
+}
+
+static u64 mem_cgroup_page_tracking_nr_entries_read(
+	struct cgroup_subsys_state *css, struct cftype *cft)
+{
+	struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+	u64 total_entries = 0;
+	struct mem_cgroup_per_node *pn;
+	int nid;
+
+	for_each_node(nid) {
+		pn = memcg->nodeinfo[nid];
+		total_entries += valid_folios_get_nr_entries(pn->valid_folios_set);
+	}
+	return total_entries;
+	return mem_cgroup_swappiness(memcg);
 }
 
 #define SEQ_BUF_SIZE SZ_4K
@@ -4030,6 +4243,33 @@ struct mem_cgroup *mem_cgroup_get_from_id(u64 id)
 	return memcg;
 }
 
+static int add_cache_ext_structures(struct mem_cgroup *memcg) {
+	int node;
+	struct mem_cgroup_per_node *pn;
+
+	if (unlikely(memcg->css.cgroup == NULL)) {
+		pr_err("cache_ext: memcg css is NULL\n");
+		return -1;
+	}
+
+	for_each_node(node) {
+		pn = memcg->nodeinfo[node];
+		struct sysinfo si;
+		si_meminfo(&si);
+		uint64_t memory_in_bytes  = si.totalram * si.mem_unit;
+		uint64_t max_num_pages = memory_in_bytes / PAGE_SIZE;
+		uint64_t num_buckets = roundup_pow_of_two(max_num_pages);
+		pr_info("cache_ext: Creating cache ext structures for node %d, num_buckets = %llu\n", node, num_buckets);
+		pn->valid_folios_set = init_valid_folios_set(node, num_buckets);
+		if (pn->valid_folios_set == NULL) {
+			pr_err("cache_ext: Failed to initialize valid folios set for node %d\n", node);
+			return -1;
+		}
+		cache_ext_ds_registry_init(&pn->cache_ext_ds_registry);
+	}
+	return 0;
+}
+
 static void free_mem_cgroup_per_node_info(struct mem_cgroup_per_node *pn)
 {
 	if (!pn)
@@ -4037,6 +4277,13 @@ static void free_mem_cgroup_per_node_info(struct mem_cgroup_per_node *pn)
 
 	free_percpu(pn->lruvec_stats_percpu);
 	kfree(pn->lruvec_stats);
+	if (pn->memcg && pn->memcg->cache_ext_valid) {
+		if (pn->valid_folios_set == NULL) {
+			pr_err("cache_ext: valid_folios_set is NULL but cgroup is cache_ext_enabled\n");
+		} else {
+			free_valid_folios_set(pn->valid_folios_set);
+		}
+	}
 	kfree(pn);
 }
 
@@ -4063,6 +4310,7 @@ static bool alloc_mem_cgroup_per_node_info(struct mem_cgroup *memcg, int node)
 
 	lruvec_init(&pn->lruvec);
 	pn->memcg = memcg;
+	pn->valid_folios_set = NULL;
 
 	memcg->nodeinfo[node] = pn;
 	return true;
@@ -4226,6 +4474,46 @@ static int mem_cgroup_css_online(struct cgroup_subsys_state *css)
 	struct mem_cgroup *memcg = mem_cgroup_from_css(css);
 	struct obj_cgroup *objcg;
 	int nid;
+
+	char name[NAME_MAX];
+	int ret;
+	if (memcg->css.cgroup == NULL) {
+		pr_err("cache_ext: Cgroup has no css.cgroup\n");
+		return -1;
+	}
+
+	ret = cgroup_name(memcg->css.cgroup, name, NAME_MAX);
+	if (ret < 0) {
+		pr_err("mem_cgroup_css_online: Failed to get cgroup name\n");
+		return -1;
+	}
+	/*
+	 * cache_ext structures (valid_folios_set + cache_ext_ds_registry)
+	 * must be allocated for a cgroup before any cache_ext struct_ops can
+	 * be safely attached to it. Originally only cgroups whose name starts
+	 * with "cache_ext" got these structures (see task 2 in policies/task.md),
+	 * which meant attaching to the root cgroup /sys/fs/cgroup succeeded but
+	 * crashed the kernel on detach via a NULL registry deref in
+	 * cache_ext_ds_registry_del_all().
+	 *
+	 * Solution A from task.md: also enable cache_ext for the root memcg so
+	 * a single global policy can cover all processes by attaching to the
+	 * root cgroup. Non-root, non-prefixed cgroups still get the minimal
+	 * guard in bpf_cache_ext_reg_ctx/unreg_ctx (returns -EINVAL / skips
+	 * teardown) instead of an Oops.
+	 */
+	if (mem_cgroup_is_root(memcg) || str_has_prefix(name, "cache_ext")) {
+		if (str_has_prefix(name, "cache_ext"))
+			pr_info("cache_ext: Cgroup %s is a cache_ext cgroup\n", name);
+		else
+			pr_info("cache_ext: Enabling cache_ext for root cgroup\n");
+		ret = add_cache_ext_structures(memcg);
+		if (ret < 0) {
+			pr_err("cache_ext: Failed to add cache ext structures for cgroup %s\n", name);
+			return -1;
+		}
+		memcg->cache_ext_valid = true;
+	}
 
 	memcg_online_kmem(memcg);
 
@@ -5095,6 +5383,10 @@ static struct cftype memory_files[] = {
 		.name = "reclaim",
 		.flags = CFTYPE_NS_DELEGATABLE,
 		.write = memory_reclaim,
+	},
+	{
+		.name = "page_tracking.nr_entries",
+		.read_u64 = mem_cgroup_page_tracking_nr_entries_read,
 	},
 	{ }	/* terminate */
 };

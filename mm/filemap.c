@@ -36,6 +36,7 @@
 #include <linux/cpuset.h>
 #include <linux/hugetlb.h>
 #include <linux/memcontrol.h>
+#include <linux/cache_ext.h>
 #include <linux/shmem_fs.h>
 #include <linux/rmap.h>
 #include <linux/delayacct.h>
@@ -221,6 +222,17 @@ static void filemap_unaccount_folio(struct address_space *mapping,
 void __filemap_remove_folio(struct folio *folio, void *shadow)
 {
 	struct address_space *mapping = folio->mapping;
+	struct mem_cgroup *memcg = folio_memcg(folio);
+	struct cache_ext_ops *pcext_ops;
+
+	rcu_read_lock();
+	pcext_ops = get_cache_ext_ops(memcg);
+	if (pcext_ops != NULL && pcext_ops->folio_evicted != NULL)
+		pcext_ops->folio_evicted(folio);
+	rcu_read_unlock();
+
+	if (memcg->cache_ext_valid)
+		valid_folios_del(folio);
 
 	trace_mm_filemap_delete_from_page_cache(folio);
 	filemap_unaccount_folio(mapping, folio);
@@ -327,12 +339,21 @@ void delete_from_page_cache_batch(struct address_space *mapping,
 
 	spin_lock(&mapping->host->i_lock);
 	xa_lock_irq(&mapping->i_pages);
+	rcu_read_lock();
 	for (i = 0; i < folio_batch_count(fbatch); i++) {
 		struct folio *folio = fbatch->folios[i];
+		struct mem_cgroup *memcg = folio_memcg(folio);
+		struct cache_ext_ops *pcext_ops = get_cache_ext_ops(memcg);
+		if (pcext_ops != NULL && pcext_ops->folio_evicted != NULL)
+			pcext_ops->folio_evicted(folio);
+
+		if (memcg->cache_ext_valid)
+			valid_folios_del(folio);
 
 		trace_mm_filemap_delete_from_page_cache(folio);
 		filemap_unaccount_folio(mapping, folio);
 	}
+	rcu_read_unlock();
 	page_cache_delete_batch(mapping, fbatch);
 	xa_unlock_irq(&mapping->i_pages);
 	if (mapping_shrinkable(mapping))
@@ -941,6 +962,19 @@ unlock:
 
 	if (xas_error(&xas))
 		goto error;
+
+	{
+		struct mem_cgroup *memcg = folio_memcg(folio);
+		struct cache_ext_ops *pcext_ops;
+
+		if (memcg->cache_ext_valid)
+			valid_folios_add(folio);
+		rcu_read_lock();
+		pcext_ops = get_cache_ext_ops(memcg);
+		if (pcext_ops != NULL && pcext_ops->folio_added != NULL)
+			pcext_ops->folio_added(folio);
+		rcu_read_unlock();
+	}
 
 	trace_mm_filemap_add_to_page_cache(folio);
 	return 0;
@@ -2679,6 +2713,64 @@ static int filemap_readahead(struct kiocb *iocb, struct file *file,
 	return 0;
 }
 
+static int filemap_read_folio_cache_ext(struct file *file, filler_t filler,
+		struct folio *folio)
+{
+	bool workingset = folio_test_workingset(folio);
+	unsigned long pflags;
+	int error;
+
+	if (unlikely(workingset))
+		psi_memstall_enter(&pflags);
+	error = filler(file, folio);
+	if (unlikely(workingset))
+		psi_memstall_leave(&pflags);
+	if (error)
+		return error;
+
+	error = folio_wait_locked_killable(folio);
+	if (error)
+		return error;
+	return 0;
+}
+
+static int __cache_ext_dio(struct file *file, struct address_space *mapping,
+			     struct kiocb *iocb, size_t count,
+			     struct folio_batch *fbatch)
+{
+	struct folio *folio;
+	pgoff_t index = (iocb->ki_pos >> PAGE_SHIFT);
+	pgoff_t last_index = DIV_ROUND_UP(iocb->ki_pos + count, PAGE_SIZE);
+	int error;
+	for (size_t i = index; i < last_index; ++i) {
+		folio = filemap_alloc_folio(mapping_gfp_mask(mapping), 0, NULL);
+		if (!folio) {
+			if (i == index)
+				return -ENOMEM;
+			return 1;
+		}
+
+		filemap_invalidate_lock_shared(mapping);
+		__folio_set_locked(folio);
+
+		folio_ref_add(folio, folio_nr_pages(folio));
+		folio->mapping = mapping;
+		folio->index = i;
+		error = filemap_read_folio_cache_ext(
+			file, mapping->a_ops->read_folio, folio);
+		filemap_invalidate_unlock_shared(mapping);
+		if (error) {
+			if (i == index)
+				return error;
+			return 1;
+		}
+
+		if (!folio_batch_add(fbatch, folio))
+			break;
+	}
+	return 1;
+}
+
 static int filemap_get_pages(struct kiocb *iocb, size_t count,
 		struct folio_batch *fbatch, bool need_uptodate)
 {
@@ -2689,6 +2781,7 @@ static int filemap_get_pages(struct kiocb *iocb, size_t count,
 	struct folio *folio;
 	unsigned int flags;
 	int err = 0;
+	bool ret = false;
 
 	/* "last_index" is the index of the folio beyond the end of the read */
 	last_index = round_up(iocb->ki_pos + count,
@@ -2699,6 +2792,27 @@ retry:
 
 	filemap_get_read_batch(mapping, index, last_index - 1, fbatch);
 	if (!folio_batch_count(fbatch)) {
+		struct mem_cgroup *memcg;
+		struct cache_ext_ops *cache_ext_ops;
+
+		rcu_read_lock();
+
+		memcg = mem_cgroup_from_task(current);
+		cache_ext_ops = get_cache_ext_ops(memcg);
+		if (cache_ext_ops && cache_ext_ops->admit_folio) {
+			struct cache_ext_admission_ctx ctx = {
+				.ino = filp->f_inode->i_ino,
+				.offset = iocb->ki_pos,
+				.size = count,
+			};
+			ret = cache_ext_ops->admit_folio(&ctx);
+		}
+
+		rcu_read_unlock();
+
+		if (ret)
+			return __cache_ext_dio(filp, mapping, iocb, count, fbatch);
+
 		DEFINE_READAHEAD(ractl, filp, &filp->f_ra, mapping, index);
 
 		if (iocb->ki_flags & IOCB_NOIO)
@@ -2788,7 +2902,7 @@ ssize_t filemap_read(struct kiocb *iocb, struct iov_iter *iter,
 	struct address_space *mapping = filp->f_mapping;
 	struct inode *inode = mapping->host;
 	struct folio_batch fbatch;
-	int i, error = 0;
+	int i, error = 0, cache_ext_flag = 0;
 	bool writably_mapped;
 	loff_t isize, end_offset;
 	loff_t last_pos = ra->prev_pos;
@@ -2820,6 +2934,8 @@ ssize_t filemap_read(struct kiocb *iocb, struct iov_iter *iter,
 		error = filemap_get_pages(iocb, iter->count, &fbatch, false);
 		if (error < 0)
 			break;
+		else if (error == 1)
+			cache_ext_flag = 1;
 
 		/*
 		 * i_size must be checked after we know the pages are Uptodate.
@@ -2858,7 +2974,7 @@ ssize_t filemap_read(struct kiocb *iocb, struct iov_iter *iter,
 
 			if (end_offset < folio_pos(folio))
 				break;
-			if (i > 0)
+			if (i > 0 && !cache_ext_flag)
 				folio_mark_accessed(folio);
 			/*
 			 * If users can be writing to this folio using arbitrary
@@ -2878,14 +2994,20 @@ ssize_t filemap_read(struct kiocb *iocb, struct iov_iter *iter,
 				error = -EFAULT;
 				break;
 			}
+
+			if (cache_ext_flag)
+				filemap_free_folio(mapping, folio);
 		}
 put_folios:
-		for (i = 0; i < folio_batch_count(&fbatch); i++) {
-			struct folio *folio = fbatch.folios[i];
+		if (!cache_ext_flag)
+			for (i = 0; i < folio_batch_count(&fbatch); i++) {
+				struct folio *folio = fbatch.folios[i];
 
-			filemap_end_dropbehind_read(folio);
-			folio_put(folio);
-		}
+				filemap_end_dropbehind_read(folio);
+				folio_put(folio);
+			}
+
+		cache_ext_flag = 0;
 		folio_batch_init(&fbatch);
 	} while (iov_iter_count(iter) && iocb->ki_pos < isize && !error);
 
