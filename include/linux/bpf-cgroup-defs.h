@@ -10,6 +10,8 @@
 
 struct bpf_prog_array;
 
+struct cache_ext_ops;
+
 #ifdef CONFIG_BPF_LSM
 /* Maximum number of concurrently attachable per-cgroup LSM hooks. */
 #define CGROUP_LSM_NUM 10
@@ -76,6 +78,13 @@ struct cgroup_bpf {
 
 	/* cgroup_bpf is released using a work queue */
 	struct work_struct release_work;
+
+	/* cache_ext: ops published/withdrawn under cache_ext_sem with
+	 * rcu_assign_pointer(); readers dereference under rcu_read_lock()
+	 * since hooks fire from atomic contexts (pte lock, xa lock).
+	 */
+	struct cache_ext_ops __rcu *cache_ext_ops;
+	struct rw_semaphore cache_ext_sem;
 };
 
 #else /* CONFIG_CGROUP_BPF */
