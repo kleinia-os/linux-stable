@@ -1,0 +1,11 @@
+# actionlint: self-hosted runner labels used by this org's workflows
+#  legacy hpc/epyc/kleinia-build runners are retained but unused)
+self-hosted-runner:
+  labels:
+    - kln-kernel
+    - kln-build
+    - kln-iso
+    - kln-ci
+    - hpc
+    - epyc
+    - kleinia-build

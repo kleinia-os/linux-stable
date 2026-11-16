@@ -1,0 +1,184 @@
+name: kernel-build
+# Kleinia kernel CI, v3 — fully native: every step runs directly on the
+# self-hosted runner (systemd service, root, unconfined). The kernel
+# buildroot (gcc/make/pahole/ccache/...) is part of the runner toolchain.
+#
+# Output: $KLN_REGISTRY/kleinia-kernel{,-devel}:7.2.11-kleinia
+# (+ .<N> sequence tag), then the kleinia image build is dispatched.
+# Registry contract: KLN_REGISTRY is the repo variable — the zot direct
+# endpoint internally (plain HTTP on the LAN), ghcr.io/kleinia-os by
+# default (public form).
+#
+# Prerequisites: a self-hosted runner labeled kln-kernel with the kernel
+# buildroot applied, and push credentials for the registry above.
+on:
+  workflow_dispatch:
+    inputs:
+      tag_seq:
+        description: 'Tag sequence N in 7.2.11-kleinia.N (default: run number)'
+        required: false
+        default: ''
+      build_jobs:
+        description: 'Parallel compile jobs (default: all cores)'
+        required: false
+        default: ''
+  push:
+    branches: ['main']
+    paths: ['kleinia/**', '.github/workflows/kernel-build.yml']
+
+env:
+  # Registry contract (same as kleinia's build.yml): artifact
+  # namespace from the repo variable, public ghcr.io form by default.
+  KLN_REGISTRY: ${{ vars.KLN_REGISTRY || 'ghcr.io/kleinia-os' }}
+  # the runner tunnel proxy; the
+  # registry and CN mirrors stay direct. Lowercase only — GitHub env keys
+  # are case-insensitive; export uppercase where a tool needs them.
+  http_proxy: http://127.0.0.1:24983
+  https_proxy: http://127.0.0.1:24983
+  no_proxy: localhost,127.0.0.1,10.0.0.0/8,192.168.0.0/16,.invalid,.ustc.edu.cn,.aliyun.com,.tuna.tsinghua.edu.cn,.cernet.edu.cn
+
+concurrency:
+  group: kernel-build
+  cancel-in-progress: true   # kernel: a new run supersedes the old one
+
+jobs:
+  kernel:
+    runs-on: [self-hosted, kln-kernel]
+    timeout-minutes: 180      # first run builds cold (empty ccache)
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: Preflight (VM + toolchain state — first stop on any failure)
+        run: |
+          set -euo pipefail
+          echo "user=$(id -un) uid=$(id -u) host=$(hostname)"
+          echo "cores=$(nproc)"; free -h | sed -n 2p
+          df -h /srv/kleinia-ci /srv/kleinia-cache | sed -n '1,3p'
+          ls -ld /srv/kleinia-ci /srv/kleinia-cache
+          # kernel buildroot (native-toolchain.sh pins); fail fast with a
+          # clear message instead of dying mid-build on a drifted VM
+          for t in gcc make pahole ccache flex bison bc perl; do
+            command -v "$t" >/dev/null || { echo "FATAL: $t missing — run the runner native-toolchain setup on the VM"; exit 2; }
+          done
+          gcc --version | head -1; pahole --version
+          # The contract registry's host, scheme inferred
+          case "${KLN_REGISTRY%%/*}" in
+            ghcr.io) RSCHEME=https ;;
+            *)       RSCHEME=http ;;   # internal plain-HTTP endpoint
+          esac
+          curl -fsS "$RSCHEME://${KLN_REGISTRY%%/*}/v2/" >/dev/null \
+            && echo "registry reachable (anonymous): $KLN_REGISTRY"
+
+      - name: Stage module signing key (1Password -> certs/, never committed)
+        # op and its checksum live on the persistent disk; host python3
+        # unzips. timeout guards the known op TLS hang (run 42999704766);
+        # pkill clears the background op process it can leave behind.
+        env:
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+        run: |
+          set -euo pipefail
+          TOOLS=/srv/kleinia-cache/kernel-tools
+          mkdir -p "$TOOLS" "$GITHUB_WORKSPACE/certs"
+          if [ ! -x "$TOOLS/op" ]; then
+            curl -fsSL -o "$TOOLS/op.zip" \
+              "https://cache.agilebits.com/dist/1P/op2/pkg/v2.41.1/op_linux_amd64_v2.41.1.zip"
+            echo "e52476700cba9202ac7469bdfb2648ecdbf3438ac85822010f77230139e74966  $TOOLS/op.zip" \
+              | sha256sum -c -
+            python3 -m zipfile -e "$TOOLS/op.zip" "$TOOLS/op-unz"
+            install -m 0755 "$TOOLS/op-unz/op" "$TOOLS/op"; rm -rf "$TOOLS/op-unz"
+          fi
+          timeout 180 "$TOOLS/op" document get "${KMODSIG_ITEM:-module-signing.pem}" \
+            --vault KleiniaOS --force --output "$GITHUB_WORKSPACE/certs/module-signing.pem"
+          pkill -f "$TOOLS/op" 2>/dev/null || true
+          [ -s "$GITHUB_WORKSPACE/certs/module-signing.pem" ] \
+            || { echo "FATAL: empty signing key"; exit 2; }
+          chmod 600 "$GITHUB_WORKSPACE/certs/module-signing.pem"
+          echo "signing key staged ($(wc -c < "$GITHUB_WORKSPACE/certs/module-signing.pem") bytes)"
+
+      - name: Build kernel (native, ccache on persistent disk)
+        run: |
+          set -euo pipefail
+          JOBS='${{ github.event.inputs.build_jobs }}'
+          export KTREE="$GITHUB_WORKSPACE"
+          export O=/srv/kleinia-ci/kernel-build/kbuild-7211        # tmpfs, ~30G
+          export CCACHE_DIR=/srv/kleinia-cache/ccache              # persistent
+          mkdir -p "$O" "$CCACHE_DIR"
+          bash kleinia/scripts/kbuild.sh '' "${JOBS:-$(nproc)}"
+
+      - name: Stage artifacts (modules_install + signed-module check + devel tar)
+        run: |
+          set -euo pipefail
+          export KTREE="$GITHUB_WORKSPACE"
+          export O=/srv/kleinia-ci/kernel-build/kbuild-7211
+          export STAGE=/srv/kleinia-ci/kernel-build/kartifact-stage
+          export KARTIFACT_STAGE_ONLY=1 KBITS=0
+          bash kleinia/scripts/kartifact.sh
+
+      - name: Build + push kernel & kernel-devel (native rootful podman)
+        env:
+          # Contract secret names; ZOT_DEV_* repo secrets stay the source
+          # of truth until the public-repo secrets exist (fallback chain)
+          KLN_REGISTRY_USER: ${{ secrets.KLN_REGISTRY_USER || secrets.ZOT_DEV_USER }}
+          KLN_REGISTRY_PASSWORD: ${{ secrets.KLN_REGISTRY_PASSWORD || secrets.ZOT_DEV_PASSWORD }}
+        run: |
+          set -euo pipefail
+          SEQ='${{ github.event.inputs.tag_seq }}'
+          SEQ="${SEQ:-$GITHUB_RUN_NUMBER}"
+          ROOT=/srv/kleinia-ci/kernel-build
+          KVER=$(sed -n 's/#define UTS_RELEASE "\(.*\)"/\1/p' \
+                   "$ROOT/kbuild-7211/include/generated/utsrelease.h")
+          [ -n "$KVER" ] || { echo "FATAL: no KVER"; exit 2; }
+          # Push endpoint: the KLN_REGISTRY contract — repo
+          # variable (zot direct endpoint internally, plain HTTP) or the
+          # public ghcr.io form. The 2026-11-11 push failures (502s ~110s
+          # into the 25G devel layer) were zot's default 60s HTTP
+          # read/write timeouts — fixed in zot config (1h timeouts).
+          REG_HOST="${KLN_REGISTRY%%/*}"
+          REG_PATH="${KLN_REGISTRY#*/}"
+          REG_OPTS=(); REG_SCHEME=https
+          if [ "$REG_HOST" != ghcr.io ]; then
+            REG_OPTS=(--tls-verify=false); REG_SCHEME=http
+          fi
+          echo "push endpoint: $KLN_REGISTRY ($REG_SCHEME)"
+          echo "$KLN_REGISTRY_PASSWORD" | podman login "$REG_HOST" \
+            -u "$KLN_REGISTRY_USER" --password-stdin "${REG_OPTS[@]}" >/dev/null 2>&1
+          unset KLN_REGISTRY_PASSWORD
+          for img in kleinia-kernel kleinia-kernel-devel; do
+            dir="$ROOT/kartifact-stage"
+            [ "$img" = kleinia-kernel-devel ] && dir="$ROOT/kartifact-stage-devel"
+            podman build -q -t "localhost/$img:$KVER" "$dir"
+            for t in "$KVER" "$KVER.$SEQ"; do
+              podman push "${REG_OPTS[@]}" \
+                "localhost/$img:$KVER" "$REG_HOST/$REG_PATH/$img:$t"
+              curl -fsSI "$REG_SCHEME://$REG_HOST/v2/$REG_PATH/$img/manifests/$t" \
+                | awk -v i="$img" -v t="$t" 'tolower($1)=="docker-content-digest:" \
+                    {gsub(/\r/,""); print "pushed+verified " i ":" t " " $2}'
+            done
+          done
+          podman logout "$REG_HOST" >/dev/null 2>&1 || true
+          echo "KVER=$KVER SEQ=$SEQ"
+          echo "KSEQ_TAG=$KVER.$SEQ" >> "$GITHUB_ENV"
+
+      - name: Trigger image build
+        run: |
+          # Pin the image build to the exact sequenced kernel tag this
+          # run pushed (e.g. 7.2.11-kleinia.20) instead of the floating
+          # tag, so image builds are auditable to a kernel build.
+          curl -fsS -X POST \
+            -H "Authorization: Bearer ${{ secrets.CROSS_REPO_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/kleinia-os/kleinia/actions/workflows/build.yml/dispatches \
+            -d "{\"ref\":\"main\",\"inputs\":{\"kernel_tag\":\"${KSEQ_TAG}\"}}"
+          echo "image-build dispatched (kernel_tag=$KSEQ_TAG)"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## kernel-build"
+            echo "- Commit: $GITHUB_SHA  Run: $GITHUB_RUN_NUMBER (fully native, v3)"
+            echo "- Images: $KLN_REGISTRY/kleinia-kernel{,-devel}:$GITHUB_RUN_NUMBER-tagged"
+            echo "- Cores: $(nproc)"
+          } >> "$GITHUB_STEP_SUMMARY" || true

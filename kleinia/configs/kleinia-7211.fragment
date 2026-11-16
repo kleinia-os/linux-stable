@@ -1,0 +1,33 @@
+# Kleinia kernel overrides on top of the Fedora distro config baseline
+# (see docs/bluebuild-decisions.md §3-D2: Fedora config as starting point)
+
+# --- agent / ext stack (our patches) ---
+CONFIG_AGENT=y
+CONFIG_AGENT_FS=y
+CONFIG_AF_AGENT=y
+CONFIG_IOSCHED_EXT=y
+CONFIG_IOSCHED_EXT_DEBUG=n
+CONFIG_SCHED_CLASS_EXT=y
+CONFIG_DEBUG_INFO_BTF=y
+CONFIG_DEBUG_INFO_BTF_MODULES=y
+CONFIG_MEMCG=y
+
+# --- clean distro naming: 7.2.11-kleinia ---
+CONFIG_LOCALVERSION="-kleinia"
+# CONFIG_LOCALVERSION_AUTO is not set
+
+# --- module signing: all modules signed with the KleiniaOS release key ---
+# key material lives in 1Password vault "KleiniaOS"; kbuild stages it into
+# certs/ at build time (see .git/info/exclude — never commit the .pem)
+CONFIG_SYSTEM_TRUSTED_KEYS="certs/module-signing.x509"
+CONFIG_SYSTEM_REVOCATION_KEYS=""
+CONFIG_MODULE_SIG_ALL=y
+CONFIG_MODULE_SIG_KEY="certs/module-signing.pem"
+# CONFIG_MODULE_SIG_FORCE is not set  (unsigned modules still load during bring-up)
+# CONFIG_SYSTEM_BLACKLIST_KEYRING is not set
+
+# --- build hygiene on non-Fedora toolchain ---
+CONFIG_WERROR=n
+
+# --- keep Fedora's zstd module compression (small artifact) ---
+CONFIG_MODULE_COMPRESS_ZSTD=y
