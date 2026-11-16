@@ -908,6 +908,11 @@ asmlinkage long sys_clock_adjtime32(clockid_t which_clock,
 asmlinkage long sys_syncfs(int fd);
 asmlinkage long sys_setns(int fd, int nstype);
 asmlinkage long sys_pidfd_open(pid_t pid, unsigned int flags);
+
+/* agent control block (acb) */
+asmlinkage long sys_acb_create(const char __user *name, unsigned int flags,
+			       unsigned int class);
+asmlinkage long sys_acb_attach(int fd);
 asmlinkage long sys_sendmmsg(int fd, struct mmsghdr __user *msg,
 			     unsigned int vlen, unsigned flags);
 asmlinkage long sys_process_vm_readv(pid_t pid,

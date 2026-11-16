@@ -13,6 +13,7 @@
 #include <linux/sched/task.h>
 #include <linux/sched/task_stack.h>
 #include <linux/sched/cputime.h>
+#include <linux/acb.h>
 #include <linux/interrupt.h>
 #include <linux/module.h>
 #include <linux/capability.h>
@@ -954,6 +955,9 @@ void __noreturn do_exit(long code)
 	audit_free(tsk);
 
 	tsk->exit_code = code;
+#ifdef CONFIG_AGENT
+	acb_task_exit(tsk);	/* leave the agent, emit MEMBER_EXIT hook */
+#endif
 	taskstats_exit(tsk, group_dead);
 	trace_sched_process_exit(tsk, group_dead);
 

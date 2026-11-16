@@ -73,6 +73,7 @@
 #include <linux/rmap.h>
 #include <linux/ksm.h>
 #include <linux/acct.h>
+#include <linux/acb.h>
 #include <linux/userfaultfd_k.h>
 #include <linux/tsacct_kern.h>
 #include <linux/cn_proc.h>
@@ -2559,6 +2560,23 @@ __latent_entropy struct task_struct *copy_process(
 	user_events_fork(p, clone_flags);
 
 	copy_oom_score_adj(clone_flags, p);
+
+#ifdef CONFIG_AGENT
+	/* the memcpy in dup_task_struct copies the parent's pointer
+	 * without a reference: take our own, or clear it */
+	p->acb = NULL;
+	if (current->acb) {
+		struct acb *acb = acb_get(current->acb);
+
+		if (acb) {
+			if (!acb_add_member(acb, p))
+				p->acb = acb;
+			else
+				acb_put(acb);
+		}
+	}
+	acb_sync_scx_class(p);
+#endif
 
 	return p;
 

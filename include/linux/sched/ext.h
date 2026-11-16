@@ -195,6 +195,13 @@ struct sched_ext_entity {
 	u32			dsq_flags;	/* protected by DSQ lock */
 	u32			flags;		/* protected by rq lock */
 	u32			weight;
+#ifdef CONFIG_AGENT
+	/* The agent identity of this task, maintained by the
+	 * ACB subsystem (0 = none/legacy, else ACB_CLASS_*).  sched_ext
+	 * programs read it as p->scx.agent_class — the scheduler's own
+	 * view of "which agent does this task belong to". */
+	u8			agent_class;
+#endif
 	s32			sticky_cpu;
 	s32			holding_cpu;
 	s32			selected_cpu;

@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: GPL-2.0
+
+menuconfig AGENT
+	bool "Agent Control Block (ACB) support"
+	default n
+	help
+	  Make agents first-class kernel objects.  An ACB (Agent Control
+	  Block) is the agent-level counterpart of a process control block:
+	  it carries identity (AID, name, class), a set of member tasks,
+	  a capability set and a message mailbox.  Skills and hooks of each
+	  agent are exposed through agentfs at /agent.
+
+if AGENT
+
+config AGENT_FS
+	bool "agentfs filesystem (mount at /agent)"
+	default y
+	help
+	  Pseudo filesystem exposing one directory per ACB with status,
+	  members, policy, skills/ and hooks/ entries.
+
+config AF_AGENT
+	bool "AF_AGENT socket address family"
+	default y
+	help
+	  Narrow transport address family carrying kernel-minted AIDs;
+	  connect() enforces ACB capability bits and routes to the target
+	  agent mailbox.
+
+endif # AGENT

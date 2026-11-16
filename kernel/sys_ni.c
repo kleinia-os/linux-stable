@@ -394,3 +394,6 @@ COND_SYSCALL(rseq_slice_yield);
 
 COND_SYSCALL(uretprobe);
 COND_SYSCALL(uprobe);
+
+COND_SYSCALL(acb_create);
+COND_SYSCALL(acb_attach);

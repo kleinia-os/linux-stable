@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: GPL-2.0
+
+config AF_AGENT
+	bool "AF_AGENT socket address family (ACB agents)"
+	default y
+	depends on AGENT
+	help
+	  Narrow transport address family over the ACB mailbox: socket
+	  addresses carry kernel-minted AIDs, connect() enforces ACB
+	  capability bits, sendmsg() enqueues skill requests and recvmsg()
+	  waits for replies.  agent:// name resolution stays in user space.

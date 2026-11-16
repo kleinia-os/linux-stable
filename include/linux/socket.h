@@ -252,10 +252,11 @@ struct ucred {
 				 */
 #define AF_XDP		44	/* XDP sockets			*/
 #define AF_MCTP		45	/* Management component
-				 * transport protocol
-				 */
+					 * transport protocol
+					 */
+#define AF_AGENT	46	/* ACB agent sockets (see uapi/linux/acb.h) */
 
-#define AF_MAX		46	/* For now.. */
+#define AF_MAX		47	/* For now.. */
 
 /* Protocol families, same as address families. */
 #define PF_UNSPEC	AF_UNSPEC

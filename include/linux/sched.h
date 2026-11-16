@@ -1108,6 +1108,12 @@ struct task_struct {
 	struct hlist_node		pid_links[PIDTYPE_MAX];
 	struct list_head		thread_node;
 
+#ifdef CONFIG_AGENT
+	/* Agent Control Block this task belongs to (agents are
+	 * first-class kernel objects; see include/linux/acb.h) */
+	struct acb			*acb;
+#endif
+
 	struct completion		*vfork_done;
 
 	/* CLONE_CHILD_SETTID: */
