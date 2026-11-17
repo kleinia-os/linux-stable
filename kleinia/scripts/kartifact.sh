@@ -7,25 +7,27 @@
 #      so external modules compile against exactly this kernel, plus the
 #      kernel-bits header set (vmlinux.h + tools headers + UAPI acb.h) at
 #      /usr/src/kleinia-kernel-bits for agent userspace/BPF builds
-# Uses rootless podman on the dev box. CI (kleinia-os/linux
-# .github/workflows/kernel-build.yml) runs it natively on the VM in
+# Uses rootless podman on the dev box. CI runs it in
 # KARTIFACT_STAGE_ONLY=1 mode (staging only); the workflow's rootful
-# podman does the OCI build + push.
-# KTREE/O/STAGE/REG/SEQ are overridable via environment. REG
-# follows the registry contract: KLN_REGISTRY first (repo variable — zot
-# direct endpoint internally), then REG, else the public ghcr.io form.
+# podman on the VM does the OCI build + dual-registry publish (internal
+# zot + ghcr). Dev-box runs below publish to BOTH as well: the internal
+# registry (REG, plain HTTP on the LAN) and the ghcr mirror
+# (GHCR_REGISTRY; disable with GHCR=0).
+# KTREE/O/STAGE/REG/GHCR_REGISTRY/SEQ are overridable via environment.
 set -euo pipefail
 : "${KTREE:=$(cd "$(dirname "$0")/../.." && pwd)}"
 : "${O:=$KTREE/.build/kbuild-7211}"
 : "${STAGE:=$KTREE/.build/kartifact-stage}"
-: "${KLN_REGISTRY:=ghcr.io/kleinia-os}"
-: "${REG:=$KLN_REGISTRY}"
+: "${REG:=127.0.0.1:5001/kleinia-os}"
+: "${GHCR_REGISTRY:=ghcr.io/kleinia-os}"
+: "${GHCR:=1}"
 REG_HOST="${REG%%/*}"; REG_OPTS=()
 if [ "$REG_HOST" != ghcr.io ]; then REG_OPTS=(--tls-verify=false); fi
 : "${SEQ:=}"
+REV="$(git -C "$KTREE" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 KVER="$(sed -n 's/#define UTS_RELEASE "\(.*\)"/\1/p' "$O/include/generated/utsrelease.h")"
 TAG="kleinia-kernel:$KVER"
-echo "== kernel $KVER -> $REG (seq tag: ${SEQ:-none}) =="
+echo "== staging kernel $KVER =="
 
 # ---- (a) kernel OCI artifact ----
 rm -rf "$STAGE"; mkdir -p "$STAGE"
@@ -56,22 +58,43 @@ EOF
 # stage dirs incl. Dockerfiles, then stop — the workflow's rootful podman
 # on the VM builds and pushes from these dirs (no privileged nested
 # podman). Dev-box runs leave it unset and get the full build+push.
+IMG_LABELS=(--label "org.opencontainers.image.version=$KVER" \
+            --label "org.opencontainers.image.revision=$REV" \
+            --label "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)")
 if [ "${KARTIFACT_STAGE_ONLY:-0}" != "1" ]; then
-  podman build -q -t "localhost/$TAG" "$STAGE"
+  podman build -q "${IMG_LABELS[@]}" -t "localhost/$TAG" "$STAGE"
 fi
 
 # ---- (b) kernel-devel OCI artifact ----
-# Everything an out-of-tree `make -C /usr/lib/modules/$KVER/build M=...`
-# needs, minus the giant vmlinux binaries (not used by module builds).
-# SECURITY: the module signing private key lives in $O/certs/ during the
-# build (CONFIG_MODULE_SIG_KEY="certs/module-signing.pem") and must never
-# enter this artifact — the registry serves anonymous reads.
+# Headers + scripts + metadata for out-of-tree `make -C .../build M=...`.
+# Selectively copied (NOT the whole O= tree — the ~50k object files are
+# 25G of dead weight). Source headers from $KTREE, generated content
+# and compiled host tools from $O. SECURITY: the module signing private
+# key lives in $O/certs/ and must never enter this artifact.
 STAGE_DEV="$STAGE-devel"; rm -rf "$STAGE_DEV"
-mkdir -p "$STAGE_DEV/lib/modules/$KVER/build"
+DEV="$STAGE_DEV/lib/modules/$KVER/build"
+mkdir -p "$DEV"
+
+# Source headers and kbuild infrastructure (from the source tree)
+cp -a "$KTREE/include" "$DEV/include"
+mkdir -p "$DEV/arch/x86"
+cp -a "$KTREE/arch/x86/include" "$DEV/arch/x86/include"
+cp "$KTREE/arch/x86/Makefile" "$DEV/arch/x86/" 2>/dev/null || true
+cp "$KTREE/Makefile" "$DEV/Makefile"
+
+# Build output: generated headers, compiled scripts, metadata —
+# exclude all object files, modules, and temporary build artifacts
 tar -C "$O" \
-    --exclude='vmlinux*' --exclude='.tmp_vmlinux*' \
+    --exclude='*.o' --exclude='*.a' --exclude='*.ko' --exclude='*.ko.*' \
+    --exclude='*.mod' --exclude='*.mod.c' --exclude='*.cmd' \
+    --exclude='*.symtypes' --exclude='built-in.a' \
+    --exclude='vmlinux*' --exclude='.tmp_*' \
     --exclude='certs/*.pem' --exclude='*.pem' \
-    -cf - . | tar -C "$STAGE_DEV/lib/modules/$KVER/build" -xf -
+    --exclude='.config.old' \
+    --exclude='arch/x86/boot' \
+    --exclude='Makefile' \
+    -cf - . | tar -C "$DEV" -xf -
+
 ln -s build "$STAGE_DEV/lib/modules/$KVER/source"
 
 # kernel-bits: the header set agent userspace/BPF builds compile against.
@@ -102,15 +125,19 @@ if [ "${KARTIFACT_STAGE_ONLY:-0}" = "1" ]; then
   echo "== stage-only: kernel=$STAGE devel=$STAGE_DEV prepared; native CI builds + pushes =="
   exit 0
 fi
-podman build -q -t "localhost/kleinia-kernel-devel:$KVER" "$STAGE_DEV"
+podman build -q "${IMG_LABELS[@]}" -t "localhost/kleinia-kernel-devel:$KVER" "$STAGE_DEV"
 
-# ---- push: floating $KVER + sequenced $KVER.$SEQ ----
+# ---- push: floating $KVER + sequenced $KVER.$SEQ, both registries ----
 push_tags() { # push_tags <local-image> [extra-tag...]
   local img="$1" t; shift
   for t in "$KVER" "$@"; do
     podman tag "localhost/$img:$KVER" "localhost/$img:$t"
     podman push "${REG_OPTS[@]}" "localhost/$img:$t" "$REG/$img:$t"
     echo "== pushed $REG/$img:$t =="
+    if [ "$GHCR" = 1 ]; then
+      podman push "localhost/$img:$t" "$GHCR_REGISTRY/$img:$t"
+      echo "== pushed $GHCR_REGISTRY/$img:$t =="
+    fi
   done
 }
 EXTRA=(); [ -n "$SEQ" ] && EXTRA+=("$KVER.$SEQ")

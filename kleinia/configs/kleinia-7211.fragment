@@ -14,7 +14,7 @@ CONFIG_MEMCG=y
 
 # --- clean distro naming: 7.2.11-kleinia ---
 CONFIG_LOCALVERSION="-kleinia"
-# CONFIG_LOCALVERSION_AUTO is not set
+CONFIG_LOCALVERSION_AUTO=n
 
 # --- module signing: all modules signed with the KleiniaOS release key ---
 # key material lives in 1Password vault "KleiniaOS"; kbuild stages it into

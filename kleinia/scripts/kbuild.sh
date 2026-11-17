@@ -8,16 +8,26 @@
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 FEDCFG="${1:-$SCRIPT_DIR/../configs/fedora-7.2.11-base.config}"
-JOBS="${2:-24}"
+JOBS="${2:-$(nproc)}"
 
 : "${KTREE:=$SCRIPT_DIR/../..}"
 : "${O:=$KTREE/.build/kbuild-7211}"
 : "${FRAG:=$SCRIPT_DIR/../configs/kleinia-7211.fragment}"
-: "${CCWRAP:=/srv/kleinia-ws/acb/dist/tools/cc-gcc}"
-# fall back to "ccache gcc": a bare `ccache` is not a compiler command —
-# the kernel's Kconfig probe dies "ccache: unknown C compiler / Sorry,
-# this C compiler is not supported" before any real compile (run 43074824048)
-[ -x "$CCWRAP" ] || CCWRAP="ccache gcc"
+: "${CCWRAP:=}"
+# When CCWRAP is unset: use icecc's compiler wrapper if the daemon is
+# running (distributed build), else plain ccache. A bare `ccache` alone
+# is not a compiler command — the kernel's Kconfig probe dies "ccache:
+# unknown C compiler" before any real compile. The icecc wrapper handles
+# both remote dispatch and local fallback.
+if [ -z "$CCWRAP" ]; then
+  if [ -x /usr/libexec/icecc/bin/gcc ] && pgrep -x iceccd >/dev/null 2>&1; then
+    CCWRAP="ccache /usr/libexec/icecc/bin/gcc"
+    echo "== icecc cluster active (CCWRAP=$CCWRAP) =="
+  else
+    CCWRAP="ccache gcc"
+    echo "== local ccache only (no icecc daemon) =="
+  fi
+fi
 export CCACHE_DIR="${CCACHE_DIR:-/home/builder/.cache/ccache-kernel}"
 CCACHE_MAXSIZE=25G ccache -M 25G >/dev/null 2>&1 || true
 
